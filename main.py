@@ -9,7 +9,7 @@ from audio_module.DOA import generate_srpphat_lookup_table, srp_phat_localizatio
 from audio_module.mic_utils import get_ps3eye_index
 from config import CHUNK_SIZE, MIC_POSITIONS, SPEED_OF_SOUND as c, SAMPLE_RATE as fs
 
-# --- Camera & Math Modules ---
+# --- Camera Modules ---
 from camera_module.camera_io import CameraIO
 from camera_module.spatial_math import SpatialMath
 from camera_module.renderer import OverlayRenderer
@@ -33,7 +33,7 @@ def audio_callback(indata, frames, time_info, status):
     if status:
         print(f"[!] Audio Status Error: {status}")
     
-    # 1. Voice Activity Detection (VAD)
+    # Voice Activity Detection (VAD)
     if not VAD(indata):
         with shared_state.lock:
             shared_state.is_active = False
@@ -42,7 +42,7 @@ def audio_callback(indata, frames, time_info, status):
     # 2. Compute Spatial Power Spectrum (SRP-PHAT)
     # Assuming lookup_table, mic_pairs, and precomputed_angles are strictly available in global scope
     global lookup_table, mic_pairs, precomputed_angles
-    estimated_angle, srp_powers = srp_phat_localization(indata, lookup_table, mic_pairs, precomputed_angles)
+    estimated_angle, srp_powers = srp_phat_localization(indata, lookup_table,precomputed_angles)
     
     # 3. Safely update the shared state for the video thread
     with shared_state.lock:
@@ -58,7 +58,7 @@ def main():
     
     # 1. Initialize Audio Structures
     global lookup_table, mic_pairs, precomputed_angles
-    lookup_table, precomputed_angles, mic_pairs = generate_srpphat_lookup_table()
+    lookup_table, precomputed_angles = generate_srpphat_lookup_table()
     audio_idx = get_ps3eye_index()
     if audio_idx is None:
         print("[!] Exiting: No valid microphone found.")
@@ -86,6 +86,7 @@ def main():
             while True:
                 # Capture visual frame
                 frame = cam.get_frame()
+                frame = cv.flip(frame, 1) # Mirror for natural interaction
                 if frame is None:
                     print("[!] Frame dropped.")
                     continue

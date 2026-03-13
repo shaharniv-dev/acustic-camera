@@ -1,51 +1,91 @@
+import sys
+import os
 import numpy as np
-import itertools
-from config import SAMPLE_RATE as fs, PED_FACTOR as pf, SPEED_OF_SOUND as c, MIC_POSITIONS
+
+# Add the parent directory to Python's system path so it can find config.py
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+# Now it will successfully find and import config from the parent folder
+import config
 
 # --- CORE MATH FUNCTION (Used by both GCC and SRP) ---
-def get_correlation_array(sig1, sig2):
-    n = len(sig1)
-    n_interpulated = n * pf
-    
-    # 1. FFT
-    fft1 = np.fft.rfft(sig1)
-    fft2 = np.fft.rfft(sig2)
-
-    # 2. Cross-power spectrum
+def get_correlation_array(fft1, fft2,dist):
+    """
+    Computes the GCC-PHAT cross-correlation array between two FFT signals with anti-aliasing and interpolation.
+    This is a helper function that returns the entire cross-correlation array, which can then be searched for peaks.
+    """
+    n = len(fft1)
+    n_interpulated = n * config.PED_FACTOR
+  
+    # 1. Cross-power spectrum
     cross_power = fft1 * np.conj(fft2)
     
-    # 3. PHAT weighting
+    # 2. PHAT weighting
     cross_power_phat = cross_power / (np.abs(cross_power) + 1e-10) 
     
-    # 4. Anti-aliasing filter (Spatial Nyquist for 6cm)
-    max_freq = 2800.0
-    freqs = np.fft.rfftfreq(n, d=1.0/fs)
+    # 3. Anti-aliasing filter (Spatial Nyquist for 6cm)
+    max_freq = config.SPEED_OF_SOUND / (2 * dist)  # Nyquist frequency based on mic pair distance
+    freqs = np.fft.rfftfreq(n, d=1.0/config.SAMPLE_RATE)
     cross_power_phat[freqs > max_freq] = 0.0
 
-    # 5. Interpolate to higher resolution (10x)
+    # 4. Interpolate to higher resolution (10x)
     padded_phat=np.zeros(n_interpulated//2 + 1, dtype=complex)
 
     # Copy the original PHAT values into the padded array
     padded_phat[:len(cross_power_phat)] = cross_power_phat
 
-    # 6. IFFT
+    # 5. IFFT
     cross_correlation = np.fft.irfft(padded_phat, n_interpulated)
     cross_correlation_shifted = np.fft.fftshift(cross_correlation)  
     
     return cross_correlation_shifted
 
-def compute_gcc_phat(sig1, sig2):
-    n = len(sig1)
-    n_interpulated = n * pf
-    effective_sample_rate = fs * pf
-
-    center_idx = n_interpulated // 2  
+def get_all_correlations_vectorized(fft_signals):
+    """
+    This is the current implementation.
+    Computes the cross-correlation arrays for all microphone pairs in a fully vectorized manner.
+    This function assumes that the input fft_signals is a 2D array of shape (num_mics, num_bins) 
+    and that the global config variables for mic pairs and frequency masking are properly defined.
+    """
     
+    # Extract signals for all pairs simultaneously 
+    # Resulting shapes: (6, config.NUM_BINS)
+    sig1_matrix = fft_signals[config.mic1_idx, :]
+    sig2_matrix = fft_signals[config.mic2_idx, :]
+    
+    # Compute cross-power spectrum for all pairs
+    cross_powers = sig1_matrix * np.conj(sig2_matrix)
+    
+    # Apply PHAT weighting
+    magnitudes = np.abs(cross_powers)
+    # Prevent division by zero
+    magnitudes[magnitudes == 0] = 1e-8 
+    phat_cross_powers = cross_powers / magnitudes
+    
+    # Apply the precomputed dynamic low-pass filter (spatial anti-aliasing)
+    filtered_cross_powers = phat_cross_powers * config.freq_mask
+    
+    # Inverse FFT for all pairs at once 
+    # Output shape: (6, config.N_FFT)
+    all_correlations = np.fft.irfft(filtered_cross_powers, n=config.N_FFT, axis=1)
+    
+    return all_correlations
+
+
+def compute_gcc_phat(fft1, fft2):
+    
+    n = len(fft1)
+    n_interpulated = n * config.PED_FACTOR
+    effective_sample_rate = config.SAMPLE_RATE * config.PED_FACTOR
+    center_idx = n_interpulated // 2  
+
     # Call the helper function to get the array instead of calculating it here
-    cross_correlation_shifted = get_correlation_array(sig1, sig2)
+    cross_correlation_shifted = get_correlation_array(fft1, fft2)
 
     # Find the RAW index of the maximum correlation peak
-    max_window = 6*pf  # +/- 6 samples at original rate, scaled by interpolation factor  
+    max_window = 6*config.PED_FACTOR  # +/- 6 samples at original rate, scaled by interpolation factor  
     start_idx = center_idx - max_window
     end_idx = center_idx + max_window + 1
 
@@ -71,7 +111,7 @@ def compute_gcc_phat(sig1, sig2):
     exact_shift_idx = shift_idx + fraction
     """
     # 6. NOW subtract the center to get the true fractional delay
-    delay_samples_padded = (shift_idx - center_idx) // pf # Scale back to original sample rate units
+    delay_samples_padded = (shift_idx - center_idx) // config.PED_FACTOR # Scale back to original sample rate units
     
     # 7. Convert to seconds
     delay_seconds = delay_samples_padded / effective_sample_rate
@@ -79,55 +119,83 @@ def compute_gcc_phat(sig1, sig2):
     return delay_seconds, delay_samples_padded
    
 def generate_srpphat_lookup_table():
-    # Generate all 6 possible unique pairs of microphones (indices 0 to 3)
-    MIC_PAIRS = list(itertools.combinations(range(len(MIC_POSITIONS)), 2))
-
-    # Create a dictionary or list to store the physical distance for each pair
-    PAIR_DISTANCES = []
-    for i, j in MIC_PAIRS:
-        # The physical distance 'd' between microphone i and microphone j
-        distance = abs(MIC_POSITIONS[i] - MIC_POSITIONS[j])
-        PAIR_DISTANCES.append(distance)
-
-
-    degrees_of_interest=np.arange(-89.5, 89.5, 1.0)  # From -89.5 to +89.5 degrees in 1 degree steps
-    delay_degree_sample = np.zeros((len(degrees_of_interest), len(MIC_PAIRS)), dtype=int)
-    for idx, angle in enumerate(degrees_of_interest):
+    """
+     Generates a lookup table for SRP-PHAT that maps each angle 
+     to the corresponding sample delays for all microphone pairs.
+     This is precomputed to allow for fast steering during localization.
+    """
+    degrees=np.arange(-89.5, 89.5, 0.5)  # From -89.5 to +89.5 degrees in 0.5 degree steps
+    delay_degree_sample = np.zeros((len(degrees), len(config.MIC_PAIRS)), dtype=int)
+    for idx, angle in enumerate(degrees):
         theta_rad = np.radians(angle)
-        for pair_idx, (i, j) in enumerate(MIC_PAIRS):
-            d = PAIR_DISTANCES[pair_idx]
-            delay = (d * np.sin(theta_rad)) / c  # Time delay in seconds
-            delay_degree_sample[idx, pair_idx] = int(np.floor(delay * fs * pf + 0.5))  # Convert delay from seconds to samples at 16 kHz
-    return delay_degree_sample, degrees_of_interest, MIC_PAIRS
+        for pair_idx, (i, j) in enumerate(config.MIC_PAIRS):
+            d = config.PAIR_DISTANCES[pair_idx]
+            delay = (d * np.sin(theta_rad)) / config.SPEED_OF_SOUND  # Time delay in seconds
+            delay_degree_sample[idx, pair_idx] = int(np.floor(delay * config.SAMPLE_RATE * config.PED_FACTOR + 0.5))  # Convert delay from seconds to samples at 16 kHz
+    return delay_degree_sample, degrees 
 
-def srp_phat_localization(audio_frame, lookup_table, mic_pairs, angles):
-
-    #compute correlation for each pair
-    correlations = []
-    for i, j in mic_pairs:
-        sig1 = audio_frame[:, i]
-        sig2 = audio_frame[:, j]
-        corr_array = get_correlation_array(sig1, sig2)
-        correlations.append(corr_array)
-    # find the middle index of the correlation array (zero delay)
-    center_idx = len(correlations[0]) // 2
-    # Array to store the energy score for each angle
-    srp_powers = np.zeros(len(angles))
-    # compute the SRP-PHAT score for each angle in the lookup table
+def srp_phat_localization(audio_frame, lookup_table, angles):
+    """
+    Performs SRP-PHAT localization on a given audio frame using the precomputed lookup table.
+    This function computes the spatial power spectrum for all angles and returns the angle with the highest power
+    along with the power spectrum itself.
+    """
+    # 1. Vectorized FFT on original chunks
+    fft_signals = np.fft.rfft(audio_frame, axis=0).T
     
-    for angle_idx in range(len(angles)):
-        score = 0
-        for pair_idx in range(len(mic_pairs)):
-            delay_offset = lookup_table[angle_idx, pair_idx]
-            target_idx = center_idx + delay_offset
-            score+= correlations[pair_idx][target_idx]
-        srp_powers[angle_idx] = score
-    # Find the angle with the maximum SRP-PHAT score
+    # 2. Extract pairs for cross-power calculation
+    sig1_matrix = fft_signals[config.mic1_idx, :]
+    sig2_matrix = fft_signals[config.mic2_idx, :]
+    
+    # 3. Compute cross-power and apply PHAT weighting
+    cross_powers = sig1_matrix * np.conj(sig2_matrix)
+    magnitudes = np.abs(cross_powers)
+    magnitudes[magnitudes == 0] = 1e-8 
+    phat_cross_powers = cross_powers / magnitudes
+    
+    # 4. Apply dynamic low-pass filter (spatial anti-aliasing)
+    filtered_cross_powers = phat_cross_powers * config.freq_mask
+    
+    # 5. Frequency Domain ZERO-PADDING to increase time resolution for IFFT
+    padded_cross_powers = np.zeros((config.num_pairs, config.PADDED_BINS), dtype=complex)
+    padded_cross_powers[:, :config.ORIG_BINS] = filtered_cross_powers
+    
+    # 6. Vectorized IFFT on the padded array
+    raw_correlations = np.fft.irfft(padded_cross_powers, n=config.PADDED_N_FFT, axis=1)
+    
+    # Shift zero-delay to the center to match lookup table 
+    correlations = np.fft.fftshift(raw_correlations, axes=1)
+    
+    # 7. Vectorized Delay-and-Sum (SRP) Steering
+    center_idx = correlations.shape[1] // 2
+    
+    # lookup_table shape is (num_angles, num_pairs)
+    # target_indices shape becomes (num_angles, num_pairs)
+    target_indices = center_idx - lookup_table
+    
+    # pair_indices shape: (num_pairs,)  np.newaxis makes it (1, num_pairs)
+    pair_indices = np.arange(config.num_pairs)
+    
+    # Advanced indexing: broadcasts row indices across all angles to extract 
+    # the exact steered value for every angle and pair simultaneously.
+    steered_correlations = correlations[pair_indices[np.newaxis, :], target_indices]
+    
+    # Sum across pairs to get the final spatial power spectrum
+    srp_powers = np.sum(steered_correlations, axis=1)
+
+    # 8. Find the Best Angle
     best_angle_idx = np.argmax(srp_powers)
     best_angle = angles[best_angle_idx]
-            
+
+   
     return best_angle, srp_powers
-def VAD(audio_frame, energy_threshold=0.01):    
+
+
+def VAD(audio_frame, energy_threshold=0.01): 
+    """
+    Simple energy-based Voice Activity Detection (VAD).
+    Returns True if voice activity is detected, False otherwise.
+    """   
  # VAD - Voice Activity Detection
     energy1 = np.mean(audio_frame[:, 0]**2)
     energy2 = np.mean(audio_frame[:, 1]**2)
@@ -138,46 +206,73 @@ def VAD(audio_frame, energy_threshold=0.01):
         return False  # No voice activity detected
     return True  # Voice activity detected
     
-def fractional_delay(signal, delay_in_samples):
-    """ Shifts a signal by a fractional number of samples using FFT """
-    N = len(signal)
-    fft_sig = np.fft.rfft(signal)
-    # Get the frequencies 
-    freqs = np.fft.rfftfreq(N)
-    # Apply phase shift: e^(-j * 2 * pi * f * delay)
-    shifted_fft = fft_sig * np.exp(-1j * 2 * np.pi * freqs * delay_in_samples)
-    return np.fft.irfft(shifted_fft, N)
 
 if __name__ == "__main__":
-    print("--- Running SRP-PHAT Sanity Check ---")
-
-    # 1. Generate the spatial map (Lookup Table)
-    lookup_table, angles, mic_pairs = generate_srpphat_lookup_table()
-
-    # 2. Simulate a sound source coming from +20 degrees
-    true_angle = 20.0
-    theta_rad = np.radians(true_angle)
-
-    # Generate random white noise as our "voice" (4000 samples)
-    source_signal = np.random.randn(4000)
-
-    # Create the empty 4-channel audio frame
-    audio_frame = np.zeros((4000, 4))
-
-    # Apply the exact delays to each microphone based on physics
-    for mic_idx in range(4):
-        dist = MIC_POSITIONS[mic_idx]
-        delay_sec = (dist * np.sin(theta_rad)) / c
+    import time
+    
+    print("--- Testing Vectorized SRP-PHAT Accuracy ---")
+    
+    # 1. Generate the lookup table
+    print("Generating lookup table...")
+    # Make sure this matches how your function actually returns values
+    lookup_table, angles = generate_srpphat_lookup_table()
+    
+    # 2. Define a known target angle for our simulated source
+    TARGET_ANGLE = 30.0  # degrees
+    theta_rad = np.radians(TARGET_ANGLE)
+    
+    # 3. Create a simulated audio frame (broadband noise)
+    # We will artificially delay this noise to mimic a physical sound wave
+    source_signal = np.random.randn(config.CHUNK_SIZE)
+    fft_source = np.fft.rfft(source_signal)
+    freqs = np.fft.rfftfreq(config.CHUNK_SIZE, 1/config.SAMPLE_RATE)
+    
+    mock_audio = np.zeros((config.CHUNK_SIZE, len(config.MIC_POSITIONS)))
+    
+    print(f"\n--- Simulating Source at {TARGET_ANGLE} degrees ---")
+    for i, pos in enumerate(config.MIC_POSITIONS):
+        # Calculate exact time delay for this mic relative to the center of the array (x=0)
+        delay_sec = (pos * np.sin(theta_rad)) / config.SPEED_OF_SOUND
         
-        # Calculate EXACT fractional delay in samples
-        exact_delay_samples = delay_sec * fs
+        # Apply exact fractional delay in the frequency domain
+        phase_shift = np.exp(-1j * 2 * np.pi * freqs * delay_sec)
+        mock_audio[:, i] = np.fft.irfft(fft_source * phase_shift)
         
-        # Shift the signal perfectly, even if it's 0.478 samples!
-        audio_frame[:, mic_idx] = fractional_delay(source_signal, exact_delay_samples)
-
-    # 3. Feed the fake audio into our SRP-PHAT function
-    estimated_angle, powers = srp_phat_localization(audio_frame, lookup_table, fs, mic_pairs, angles)
-
-    print(f"Target True Angle: {true_angle} degrees")
-    print(f"SRP-PHAT Estimated Angle: {estimated_angle} degrees")
+        print(f"Mic {i} (pos {pos}m): absolute delay = {delay_sec*1000:.3f} ms")
+        
+    print("\n--- Theoretical Pairwise Delays (Your Lookup Table Logic) ---")
+    for pair_idx, (i, j) in enumerate(config.MIC_PAIRS):
+        d = config.PAIR_DISTANCES[pair_idx]
+        pair_delay_sec = (d * np.sin(theta_rad)) / config.SPEED_OF_SOUND
+        
+        # This is your exact formula for padded samples:
+        pair_delay_samples = int(np.floor(pair_delay_sec * config.SAMPLE_RATE * config.PED_FACTOR + 0.5))
+        
+        print(f"Pair ({i}, {j}): dist = {d:.2f}m | delay = {pair_delay_sec*1000:.3f} ms | padded shift = {pair_delay_samples} samples")
+        
+    # 4. Run the localization function
+    print("\n--- Running srp_phat_localization... ---")
+    start_time = time.perf_counter()
+    
+    best_angle, srp_powers = srp_phat_localization(mock_audio, lookup_table, angles)
+    
+    end_time = time.perf_counter()
+    execution_time_ms = (end_time - start_time) * 1000
+    
+    # 5. Print final validation results
+    print("\n--- Results ---")
+    print(f"Target simulated angle:   {TARGET_ANGLE} degrees")
+    print(f"Estimated measured angle: {best_angle} degrees")
+    
+    # Calculate error
+    error = abs(TARGET_ANGLE - best_angle)
+    print(f"Absolute Error:           {error:.2f} degrees")
+    
+    # We allow a tiny margin of error because your grid resolution is 1.0 degree steps
+    if error <= 1.0:  
+        print("Status: SUCCESS! The math, matrices, and indexing are perfectly aligned.")
+    else:
+        print("Status: FAILED. The estimated angle is too far from the target.")
+        
+    print(f"Execution time: {execution_time_ms:.2f} ms")
    
